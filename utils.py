@@ -4,7 +4,7 @@ import pandas as pd
 from PIL import Image
 from typing import Tuple, Optional, List, Dict
 
-# Lazy cv2 import
+# Lazy imports to avoid import-time binary issues on cloud
 def _lazy_cv2():
     try:
         import cv2
@@ -12,12 +12,12 @@ def _lazy_cv2():
     except Exception:
         return None
 
-# Lazy YOLO import
 def _lazy_YOLO():
     try:
         from ultralytics import YOLO
         return YOLO
     except Exception as e:
+        # re-raise with context for logs
         raise RuntimeError('ultralytics import failed: ' + str(e))
 
 MODEL_PATH = os.getenv('HAZARDVISION_MODEL', 'yolov8n.pt')
@@ -42,6 +42,13 @@ def _load_model():
 
 # ---------------- Spill detection heuristics ----------------
 def detect_spills_np(img: np.ndarray, min_area:int=400) -> Tuple[np.ndarray, List[List[int]], List[int]]:
+    """Detect candidate spill regions using HSV + texture heuristics.
+
+    Returns:
+        mask_final: uint8 mask (0/255)
+        bboxes: list of [x1,y1,x2,y2]
+        areas: list of contour areas
+    """
     cv2 = _lazy_cv2()
     if cv2 is None:
         return np.zeros(img.shape[:2], dtype='uint8'), [], []
@@ -53,23 +60,23 @@ def detect_spills_np(img: np.ndarray, min_area:int=400) -> Tuple[np.ndarray, Lis
     s = hsv[:,:,1].astype(int)
     hh = hsv[:,:,0].astype(int)
 
-    # heuristics for many liquid types
-    spec_mask = (v > 200) & (s < 80)           # specular sheen (clear water)
-    milk_mask = (v > 180) & (s < 90)           # milk/yogurt/white
-    dark_mask = (v < 120) & (s < 120)          # dark liquids like cola
+    # Heuristics covering many liquids
+    spec_mask = (v > 200) & (s < 80)           # specular (clear water sheen)
+    milk_mask = (v > 180) & (s < 90)           # milk / yogurt
+    dark_mask = (v < 120) & (s < 120)          # dark liquids (soda/cola)
     oil_mask = ((hh >= 5) & (hh <= 45)) & (s > 50) & (v > 100)  # oil-ish
-    color_mask = (s > 60) & (v > 90)           # colored detergents/juices
+    color_mask = (s > 60) & (v > 90)           # colored detergents / juices
 
     raw = (spec_mask | milk_mask | dark_mask | oil_mask | color_mask).astype('uint8') * 255
 
-    # low texture filter (spills are smoother)
+    # Low-texture filter (spills often smooth)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     lap_var = cv2.convertScaleAbs(cv2.normalize(np.abs(lap), None, 0, 255, cv2.NORM_MINMAX))
     low_texture = lap_var < 20
     raw = cv2.bitwise_and(raw, (low_texture.astype('uint8')*255))
 
-    # morphology
+    # Morphological cleanup
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
     clean = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, kernel, iterations=2)
     clean = cv2.morphologyEx(clean, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -112,38 +119,48 @@ def analyze_obstruction(objects: List[Dict], img_shape:Tuple[int,int], center_st
 
 # ---------------- Main combined detection ----------------
 def detect_hazards(pil_image: Image.Image, conf:float=0.25, min_spill_area:int=400):
+    """Run YOLO detection + heuristics and return (DataFrame, annotated PIL.Image or None)."""
     cv2 = _lazy_cv2()
     model = _load_model()
-    img = np.array(pil_image)  # RGB
+    # Ensure input is RGB numpy array
+    if isinstance(pil_image, Image.Image):
+        img = np.array(pil_image)
+    else:
+        # fallback if user passed np array already
+        img = np.asarray(pil_image)
     h, w = img.shape[:2]
 
     # YOLO detections
     results = model.predict(img, conf=conf, verbose=False)
     objects = []
     annotated = img.copy()
-    if results and len(results)>0:
+
+    if results and len(results) > 0:
         r = results[0]
         names = getattr(r, 'names', {}) or {}
         boxes = getattr(r, 'boxes', None)
         if boxes is not None:
-            # try multiple access patterns for compatibility
+            # robust extraction of boxes depending on ultralytics version
             try:
                 xyxy = boxes.xyxy.cpu().numpy()
                 cls_ids = boxes.cls.cpu().numpy().astype(int)
                 confs = boxes.conf.cpu().numpy()
             except Exception:
-                # fallback if boxes data structure differs
-                xyxy = getattr(boxes, 'xyxy', None)
-                cls_ids = getattr(boxes, 'cls', None)
-                confs = getattr(boxes, 'conf', None)
-                if xyxy is None:
+                # fallback: try .data or pandas if available
+                try:
+                    df = r.boxes.data
+                    # if still not usable, continue gracefully
+                    xyxy = []
+                    cls_ids = []
+                    confs = []
+                except Exception:
                     xyxy = []
                     cls_ids = []
                     confs = []
             for b, cid, sc in zip(xyxy, cls_ids, confs):
                 x1,y1,x2,y2 = map(int, b)
                 name = names.get(int(cid), str(cid))
-                objects.append({'name':name, 'bbox':[x1,y1,x2,y2], 'conf': float(sc)})
+                objects.append({'name': name, 'bbox': [x1,y1,x2,y2], 'conf': float(sc)})
                 if cv2 is not None:
                     cv2.rectangle(annotated, (x1,y1), (x2,y2), (0,255,0), 2)
                     cv2.putText(annotated, f"{name}:{sc:.2f}", (x1, max(15,y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
@@ -161,7 +178,7 @@ def detect_hazards(pil_image: Image.Image, conf:float=0.25, min_spill_area:int=4
     detections = []
     if spill_mask.sum() > 0 and cv2 is not None:
         overlay = annotated.copy()
-        overlay[spill_mask>0] = (255,0,0)
+        overlay[spill_mask>0] = (255,0,0)  # red overlay where spill mask is present (RGB)
         alpha = 0.45
         annotated = cv2.addWeighted(overlay.astype('uint8'), alpha, annotated.astype('uint8'), 1-alpha, 0)
         for i, box in enumerate(spill_boxes):
@@ -172,7 +189,7 @@ def detect_hazards(pil_image: Image.Image, conf:float=0.25, min_spill_area:int=4
                 cv2.putText(annotated, f"Spill area={area}", (x1, max(15,y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
             detections.append({'Hazard':'spill', 'Confidence':0.9, 'Type':'spill', 'bbox':[x1,y1,x2,y2], 'area':area})
 
-    # include YOLO objects and issues
+    # include YOLO object detections
     for obj in objects:
         detections.append({'Hazard': obj['name'], 'Confidence': obj['conf'], 'Type':'object', 'bbox': obj['bbox']})
     for it in issues:
@@ -185,3 +202,8 @@ def detect_hazards(pil_image: Image.Image, conf:float=0.25, min_spill_area:int=4
 
     df = pd.DataFrame(detections)
     return df, annotated_pil
+
+# Camera placeholder helpers
+def camera_available():
+    cv2 = _lazy_cv2()
+    return cv2 is not None
