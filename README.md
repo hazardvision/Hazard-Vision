@@ -1,1 +1,3 @@
-# HazardVision — Advanced ready (fixed syntax + heuristics)\n\nDeploy on Streamlit Cloud with Python 3.10 (runtime.txt included).
+# HazardVision
+Spill & obstruction detection app for supermarkets and warehouses.
+Compatible with Streamlit Cloud (Python 3.10).
